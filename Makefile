@@ -1,6 +1,6 @@
 # Makefile
 
-NVCC        := /usr/local/cuda/bin/nvcc
+NVCC        := nvcc
 COMMON_SRCS := common.cc
 HEADERS := kseq/kseq.h
 
@@ -15,7 +15,8 @@ OUTPUT_GPU  := matcher
 all: $(OUTPUT_GEN) $(OUTPUT_GEN_SIG) $(OUTPUT_GPU)
 
 $(OUTPUT_GPU): kernel_skeleton.cu $(COMMON_SRCS)
-	$(NVCC) $(CXXFLAGS) -lineinfo -dlto -arch=native -o $@ $^
+	# $(NVCC) $(CXXFLAGS) -lineinfo -dlto -arch=native -o $@ $^
+	nvcc -O3 -lineinfo -o matcher kernel_skeleton.cu common.cc
 
 $(OUTPUT_GEN): gen_sample.cc 
 	$(CXX) $(CXXFLAGS) -o $@ $^
