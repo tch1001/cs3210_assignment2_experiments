@@ -13,9 +13,11 @@ if [[ -z "$INPUT" ]]; then
 fi
 
 # Run ./bench-a100 and save output
+echo "Running ./bench-a100"
 ./bench-a100 "${INPUT}.fastq" "${INPUT}.fasta" > bench_a100_output.txt
 
 # Run ./matcher and save output
+echo "Running ./matcher"
 ./matcher "${INPUT}.fastq" "${INPUT}.fasta" > matcher_output.txt
 
 if diff -q bench_a100_output.txt matcher_output.txt > /dev/null; then
