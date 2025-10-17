@@ -2,55 +2,53 @@
 #include "common.h"
 #include <cuda_runtime.h>
 
-__device__ inline bool base_match(char sample_base, char sig_base) {
+__device__ inline bool match(char sample_base, char sig_base) {
     return (sample_base == 'N') || (sample_base == sig_base);
 }
 
-struct DeviceSeqView {
+struct KSeqWithPointers {
     const char* seq;
     const char* qual;
     size_t len;
-    const int* qprefix; 
+    const int* qual_prefix_sum; 
 };
 
-struct DeviceMatchResult {
-    int sample_idx;
-    int sig_idx;
+struct MatchResultOnGPU {
+    int n;
+    int m;
     int integrity_hash;
     float match_score;
     int match_found;
 };
 
 __global__ void matcher_kernel(
-        DeviceSeqView* d_samples, DeviceSeqView* d_sigs,
-        int num_samples, int num_sigs, const int* d_sample_hashes, DeviceMatchResult* d_results)
+        KSeqWithPointers* device_samples, KSeqWithPointers* device_signatures,
+        int N, int M, const int* device_integrity_hashes, MatchResultOnGPU* device_results)
 {
-    int sample_idx = blockIdx.y;
-    int sig_idx = blockIdx.x;
+    int n = blockIdx.y;
+    int m = blockIdx.x;
     int tid = threadIdx.x;
 
-    if (sample_idx >= num_samples || sig_idx >= num_sigs) return;
+    KSeqWithPointers s = device_samples[n];
+    KSeqWithPointers sig = device_signatures[m];
 
-    DeviceSeqView s = d_samples[sample_idx];
-    DeviceSeqView sig = d_sigs[sig_idx];
+    int sample_length = (int)s.len;
+    int signature_length = (int)sig.len;
 
-    int sam_len = (int)s.len;
-    int sig_len = (int)sig.len;
-
-    float thread_best_score = -1e9f;
+    float thread_best_score = -1;
     int thread_best_pos = -1;
 
-    for (int i = tid; i + sig_len <= sam_len; i += blockDim.x) {
+    for (int i = tid; i + signature_length <= sample_length; i += blockDim.x) {
         bool found = true;
-        for (int j = 0; j < sig_len; ++j) {
-            if (!base_match(s.seq[i + j], sig.seq[j])) {
+        for (int j = 0; j < signature_length; ++j) {
+            if (!match(s.seq[i + j], sig.seq[j])) {
                 found = false;
                 break;
             }
         }
         if (found) {
-            int qsum = s.qprefix[i + sig_len] - s.qprefix[i];
-            float match_score = (float)qsum / (float)sig_len;
+            int total_qual = s.qual_prefix_sum[i + signature_length] - s.qual_prefix_sum[i];
+            float match_score = (float)total_qual / (float)signature_length;
             if (match_score > thread_best_score) {
                 thread_best_score = match_score;
                 thread_best_pos = i;
@@ -58,8 +56,8 @@ __global__ void matcher_kernel(
         }
     }
 
-    extern __shared__ unsigned char shared_raw[];
-    float* s_scores = (float*)shared_raw;
+    extern __shared__ unsigned char shmem[];
+    float* s_scores = (float*)shmem;
     int* s_pos = (int*)(s_scores + blockDim.x);
 
     s_scores[tid] = thread_best_score;
@@ -79,12 +77,12 @@ __global__ void matcher_kernel(
     }
 
     if (tid == 0) {
-        int out_idx = sample_idx * num_sigs + sig_idx;
-        d_results[out_idx].sample_idx = sample_idx;
-        d_results[out_idx].sig_idx = sig_idx;
-        d_results[out_idx].integrity_hash = d_sample_hashes[sample_idx];
-        d_results[out_idx].match_score = s_scores[0];
-        d_results[out_idx].match_found = (s_pos[0] >= 0) ? 1 : 0;
+        int out_idx = n * M + m;
+        device_results[out_idx].n = n;
+        device_results[out_idx].m = m;
+        device_results[out_idx].integrity_hash = device_integrity_hashes[n];
+        device_results[out_idx].match_score = s_scores[0];
+        device_results[out_idx].match_found = (s_pos[0] >= 0) ? 1 : 0;
     }
 }
 
@@ -92,142 +90,140 @@ void runMatcher(const std::vector<klibpp::KSeq>& samples,
                 const std::vector<klibpp::KSeq>& signatures,
                 std::vector<MatchResult>& matches)
 {
-    matches.clear();
-    int num_samples = samples.size();
-    int num_sigs = signatures.size();
-    if (num_samples == 0 || num_sigs == 0) return;
+    int N = samples.size();
+    int M = signatures.size();
 
-    std::vector<char> h_sample_seqs, h_sample_quals, h_sig_seqs, h_sig_quals;
-    std::vector<DeviceSeqView> h_sample_views(num_samples), h_sig_views(num_sigs);
-    std::vector<int> h_sample_hashes(num_samples);
-    std::vector<int> h_sample_qual_prefix;
+    std::vector<char> host_sample_dna, host_sample_score, host_signature_dna, host_signature_score;
+    std::vector<KSeqWithPointers> host_samples(N), host_signatures(M);
+    std::vector<int> integrity_hash(N);
+    std::vector<int> host_sample_score_prefix_sum;
 
     size_t seq_offset = 0, qual_offset = 0;
     size_t total_sample_len = 0;
-    for (int i = 0; i < num_samples; ++i) total_sample_len += samples[i].seq.size();
-    h_sample_seqs.reserve(total_sample_len);
-    h_sample_quals.reserve(total_sample_len);
-    h_sample_qual_prefix.reserve(total_sample_len + num_samples);
+    for (int i = 0; i < N; ++i) total_sample_len += samples[i].seq.size();
+    host_sample_dna.reserve(total_sample_len);
+    host_sample_score.reserve(total_sample_len);
+    host_sample_score_prefix_sum.reserve(total_sample_len + N);
 
     size_t prefix_offset = 0;
-    for (int i = 0; i < num_samples; ++i) {
-        h_sample_views[i].seq = nullptr;
-        h_sample_views[i].qual = nullptr;
-        h_sample_views[i].len = samples[i].seq.size();
+    for (int i = 0; i < N; ++i) {
+        host_samples[i].seq = nullptr;
+        host_samples[i].qual = nullptr;
+        host_samples[i].len = samples[i].seq.size();
 
-        h_sample_views[i].seq = (const char*)(seq_offset);
-        h_sample_seqs.insert(h_sample_seqs.end(), samples[i].seq.begin(), samples[i].seq.end());
+        host_samples[i].seq = (const char*)(seq_offset);
+        host_sample_dna.insert(host_sample_dna.end(), samples[i].seq.begin(), samples[i].seq.end());
         seq_offset += samples[i].seq.size();
 
-        h_sample_views[i].qual = (const char*)(qual_offset);
-        h_sample_quals.insert(h_sample_quals.end(), samples[i].qual.begin(), samples[i].qual.end());
+        host_samples[i].qual = (const char*)(qual_offset);
+        host_sample_score.insert(host_sample_score.end(), samples[i].qual.begin(), samples[i].qual.end());
         qual_offset += samples[i].qual.size();
 
-        int integrity_hash = 0;
-        for (char qc : samples[i].qual) integrity_hash += ((int)qc - 33);
-        h_sample_hashes[i] = integrity_hash % 97;
+        int sample_integrity_hash = 0;
+        for (char qc : samples[i].qual) sample_integrity_hash += ((int)qc - 33);
+        integrity_hash[i] = sample_integrity_hash % 97;
 
-        h_sample_views[i].qprefix = (const int*)(prefix_offset);
-        int running = 0;
-        h_sample_qual_prefix.push_back(running);
+        host_samples[i].qual_prefix_sum = (const int*)(prefix_offset);
+        int cur = 0;
+        host_sample_score_prefix_sum.push_back(cur);
         ++prefix_offset;
         for (char qc : samples[i].qual) {
-            running += ((int)qc - 33);
-            h_sample_qual_prefix.push_back(running);
+            cur += ((int)qc - 33);
+            host_sample_score_prefix_sum.push_back(cur);
             ++prefix_offset;
         }
     }
     seq_offset = qual_offset = 0;
-    for (int i = 0; i < num_sigs; ++i) {
-        h_sig_views[i].seq = nullptr;
-        h_sig_views[i].qual = nullptr;
-        h_sig_views[i].len = signatures[i].seq.size();
+    for (int i = 0; i < M; ++i) {
+        host_signatures[i].seq = nullptr;
+        host_signatures[i].qual = nullptr;
+        host_signatures[i].len = signatures[i].seq.size();
 
-        h_sig_views[i].seq = (const char*)(seq_offset);
-        h_sig_seqs.insert(h_sig_seqs.end(), signatures[i].seq.begin(), signatures[i].seq.end());
+        host_signatures[i].seq = (const char*)(seq_offset);
+        host_signature_dna.insert(host_signature_dna.end(), signatures[i].seq.begin(), signatures[i].seq.end());
         seq_offset += signatures[i].seq.size();
 
-        h_sig_views[i].qual = (const char*)(qual_offset);
-        h_sig_quals.insert(h_sig_quals.end(), signatures[i].qual.begin(), signatures[i].qual.end());
+        host_signatures[i].qual = (const char*)(qual_offset);
+        host_signature_score.insert(host_signature_score.end(), signatures[i].qual.begin(), signatures[i].qual.end());
         qual_offset += signatures[i].qual.size();
-        h_sig_views[i].qprefix = nullptr;
+        host_signatures[i].qual_prefix_sum = nullptr;
     }
 
-    char *d_sample_seqs, *d_sample_quals, *d_sig_seqs, *d_sig_quals;
-    DeviceSeqView *d_sample_views, *d_sig_views;
-    size_t total_sample_seq_len = h_sample_seqs.size();
-    size_t total_sample_qual_len = h_sample_quals.size();
-    size_t total_sig_seq_len = h_sig_seqs.size();
-    size_t total_sig_qual_len = h_sig_quals.size();
-    int *d_sample_hashes = nullptr;
-    int *d_sample_qual_prefix = nullptr;
-    size_t total_sample_prefix_len = h_sample_qual_prefix.size();
+    char *device_sample_dna, *device_sample_score, *device_signature_dna, *device_signature_score;
+    KSeqWithPointers *device_samples, *device_signatures;
+    size_t total_sample_seq_len = host_sample_dna.size();
+    size_t total_sample_qual_len = host_sample_score.size();
+    size_t total_sig_seq_len = host_signature_dna.size();
+    size_t total_sig_qual_len = host_signature_score.size();
+    int *device_integrity_hashes = nullptr;
+    int *device_sample_score_prefix_sum = nullptr;
+    size_t total_sample_prefix_len = host_sample_score_prefix_sum.size();
 
-    cudaMalloc(&d_sample_seqs, total_sample_seq_len);
-    cudaMalloc(&d_sample_quals, total_sample_qual_len);
-    cudaMalloc(&d_sig_seqs, total_sig_seq_len);
-    cudaMalloc(&d_sig_quals, total_sig_qual_len);
-    cudaMalloc(&d_sample_views, num_samples * sizeof(DeviceSeqView));
-    cudaMalloc(&d_sig_views, num_sigs * sizeof(DeviceSeqView));
-    cudaMalloc(&d_sample_hashes, num_samples * sizeof(int));
-    cudaMalloc(&d_sample_qual_prefix, total_sample_prefix_len * sizeof(int));
+    cudaMalloc(&device_sample_dna, total_sample_seq_len);
+    cudaMalloc(&device_sample_score, total_sample_qual_len);
+    cudaMalloc(&device_signature_dna, total_sig_seq_len);
+    cudaMalloc(&device_signature_score, total_sig_qual_len);
+    cudaMalloc(&device_samples, N * sizeof(KSeqWithPointers));
+    cudaMalloc(&device_signatures, M * sizeof(KSeqWithPointers));
+    cudaMalloc(&device_integrity_hashes, N * sizeof(int));
+    cudaMalloc(&device_sample_score_prefix_sum, total_sample_prefix_len * sizeof(int));
 
-    cudaMemcpy(d_sample_seqs, h_sample_seqs.data(), total_sample_seq_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sample_quals, h_sample_quals.data(), total_sample_qual_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sig_seqs, h_sig_seqs.data(), total_sig_seq_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sig_quals, h_sig_quals.data(), total_sig_qual_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sample_hashes, h_sample_hashes.data(), num_samples * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sample_qual_prefix, h_sample_qual_prefix.data(), total_sample_prefix_len * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_sample_dna, host_sample_dna.data(), total_sample_seq_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_sample_score, host_sample_score.data(), total_sample_qual_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_signature_dna, host_signature_dna.data(), total_sig_seq_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_signature_score, host_signature_score.data(), total_sig_qual_len, cudaMemcpyHostToDevice);
+    cudaMemcpy(device_integrity_hashes, integrity_hash.data(), N * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_sample_score_prefix_sum, host_sample_score_prefix_sum.data(), total_sample_prefix_len * sizeof(int), cudaMemcpyHostToDevice);
 
     seq_offset = qual_offset = 0;
     prefix_offset = 0;
-    for (int i = 0; i < num_samples; ++i) {
-        h_sample_views[i].seq = d_sample_seqs + seq_offset;
-        h_sample_views[i].qual = d_sample_quals + qual_offset;
-        h_sample_views[i].qprefix = d_sample_qual_prefix + prefix_offset;
+    for (int i = 0; i < N; ++i) {
+        host_samples[i].seq = device_sample_dna + seq_offset;
+        host_samples[i].qual = device_sample_score + qual_offset;
+        host_samples[i].qual_prefix_sum = device_sample_score_prefix_sum + prefix_offset;
         seq_offset += samples[i].seq.size();
         qual_offset += samples[i].qual.size();
         prefix_offset += (samples[i].qual.size() + 1);
     }
     seq_offset = qual_offset = 0;
-    for (int i = 0; i < num_sigs; ++i) {
-        h_sig_views[i].seq = d_sig_seqs + seq_offset;
-        h_sig_views[i].qual = d_sig_quals + qual_offset;
-        h_sig_views[i].qprefix = nullptr;
+    for (int i = 0; i < M; ++i) {
+        host_signatures[i].seq = device_signature_dna + seq_offset;
+        host_signatures[i].qual = device_signature_score + qual_offset;
+        host_signatures[i].qual_prefix_sum = nullptr;
         seq_offset += signatures[i].seq.size();
         qual_offset += signatures[i].qual.size();
     }
 
-    cudaMemcpy(d_sample_views, h_sample_views.data(), num_samples * sizeof(DeviceSeqView), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_sig_views, h_sig_views.data(), num_sigs * sizeof(DeviceSeqView), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_samples, host_samples.data(), N * sizeof(KSeqWithPointers), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_signatures, host_signatures.data(), M * sizeof(KSeqWithPointers), cudaMemcpyHostToDevice);
 
-    size_t num_results = num_samples * num_sigs;
-    DeviceMatchResult* d_results;
-    cudaMalloc(&d_results, num_results * sizeof(DeviceMatchResult));
+    size_t num_results = N * M;
+    MatchResultOnGPU* device_results;
+    cudaMalloc(&device_results, num_results * sizeof(MatchResultOnGPU));
 
     int block_size = 256;
-    dim3 grid(num_sigs, num_samples);
+    dim3 grid(M, N);
     size_t shared_bytes = block_size * (sizeof(float) + sizeof(int));
-    matcher_kernel<<<grid, block_size, shared_bytes>>>(d_sample_views, d_sig_views, num_samples, num_sigs, d_sample_hashes, d_results);
+    matcher_kernel<<<grid, block_size, shared_bytes>>>(device_samples, device_signatures, N, M, device_integrity_hashes, device_results);
     cudaDeviceSynchronize();
 
-    std::vector<DeviceMatchResult> h_results(num_results);
-    cudaMemcpy(h_results.data(), d_results, num_results * sizeof(DeviceMatchResult), cudaMemcpyDeviceToHost);
+    std::vector<MatchResultOnGPU> host_results(num_results);
+    cudaMemcpy(host_results.data(), device_results, num_results * sizeof(MatchResultOnGPU), cudaMemcpyDeviceToHost);
 
-    for (const auto& r : h_results) {
+    for (const auto& r : host_results) {
         if (r.match_found) {
             MatchResult match;
-            match.sample_name = samples[r.sample_idx].name;
-            match.signature_name = signatures[r.sig_idx].name;
+            match.sample_name = samples[r.n].name;
+            match.signature_name = signatures[r.m].name;
             match.integrity_hash = r.integrity_hash;
             match.match_score = r.match_score;
             matches.push_back(match);
         }
     }
 
-    cudaFree(d_sample_seqs); cudaFree(d_sample_quals);
-    cudaFree(d_sig_seqs); cudaFree(d_sig_quals);
-    cudaFree(d_sample_views); cudaFree(d_sig_views);
-    cudaFree(d_sample_hashes); cudaFree(d_sample_qual_prefix);
-    cudaFree(d_results);
+    cudaFree(device_sample_dna); cudaFree(device_sample_score);
+    cudaFree(device_signature_dna); cudaFree(device_signature_score);
+    cudaFree(device_samples); cudaFree(device_signatures);
+    cudaFree(device_integrity_hashes); cudaFree(device_sample_score_prefix_sum);
+    cudaFree(device_results);
 }
