@@ -23,7 +23,7 @@ struct MatchResultOnGPU {
 
 __global__ void matcher_kernel(
         KSeqWithPointers* device_samples, KSeqWithPointers* device_signatures,
-        int N, int M, const int* device_integrity_hashes, MatchResultOnGPU* device_results)
+        int N, int M, MatchResultOnGPU* device_results)
 {
     int n = blockIdx.y;
     int m = blockIdx.x;
@@ -80,7 +80,6 @@ __global__ void matcher_kernel(
         int out_idx = n * M + m;
         device_results[out_idx].n = n;
         device_results[out_idx].m = m;
-        device_results[out_idx].integrity_hash = device_integrity_hashes[n];
         device_results[out_idx].match_score = s_scores[0];
         device_results[out_idx].match_found = (s_pos[0] >= 0) ? 1 : 0;
     }
@@ -155,7 +154,6 @@ void runMatcher(const std::vector<klibpp::KSeq>& samples,
     size_t total_sample_qual_len = host_sample_score.size();
     size_t total_sig_seq_len = host_signature_dna.size();
     size_t total_sig_qual_len = host_signature_score.size();
-    int *device_integrity_hashes = nullptr;
     int *device_sample_score_prefix_sum = nullptr;
     size_t total_sample_prefix_len = host_sample_score_prefix_sum.size();
 
@@ -165,14 +163,12 @@ void runMatcher(const std::vector<klibpp::KSeq>& samples,
     cudaMalloc(&device_signature_score, total_sig_qual_len);
     cudaMalloc(&device_samples, N * sizeof(KSeqWithPointers));
     cudaMalloc(&device_signatures, M * sizeof(KSeqWithPointers));
-    cudaMalloc(&device_integrity_hashes, N * sizeof(int));
     cudaMalloc(&device_sample_score_prefix_sum, total_sample_prefix_len * sizeof(int));
 
     cudaMemcpy(device_sample_dna, host_sample_dna.data(), total_sample_seq_len, cudaMemcpyHostToDevice);
     cudaMemcpy(device_sample_score, host_sample_score.data(), total_sample_qual_len, cudaMemcpyHostToDevice);
     cudaMemcpy(device_signature_dna, host_signature_dna.data(), total_sig_seq_len, cudaMemcpyHostToDevice);
     cudaMemcpy(device_signature_score, host_signature_score.data(), total_sig_qual_len, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_integrity_hashes, integrity_hash.data(), N * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(device_sample_score_prefix_sum, host_sample_score_prefix_sum.data(), total_sample_prefix_len * sizeof(int), cudaMemcpyHostToDevice);
 
     seq_offset = qual_offset = 0;
@@ -204,18 +200,19 @@ void runMatcher(const std::vector<klibpp::KSeq>& samples,
     int block_size = 256;
     dim3 grid(M, N);
     size_t shared_bytes = block_size * (sizeof(float) + sizeof(int));
-    matcher_kernel<<<grid, block_size, shared_bytes>>>(device_samples, device_signatures, N, M, device_integrity_hashes, device_results);
+    matcher_kernel<<<grid, block_size, shared_bytes>>>(device_samples, device_signatures, N, M, device_results);
     cudaDeviceSynchronize();
 
     std::vector<MatchResultOnGPU> host_results(num_results);
     cudaMemcpy(host_results.data(), device_results, num_results * sizeof(MatchResultOnGPU), cudaMemcpyDeviceToHost);
 
-    for (const auto& r : host_results) {
+    for (size_t result_idx = 0; result_idx < host_results.size(); ++result_idx) {
+        const auto& r = host_results[result_idx];
         if (r.match_found) {
             MatchResult match;
             match.sample_name = samples[r.n].name;
             match.signature_name = signatures[r.m].name;
-            match.integrity_hash = r.integrity_hash;
+            match.integrity_hash = integrity_hash[r.n];
             match.match_score = r.match_score;
             matches.push_back(match);
         }
@@ -224,6 +221,6 @@ void runMatcher(const std::vector<klibpp::KSeq>& samples,
     cudaFree(device_sample_dna); cudaFree(device_sample_score);
     cudaFree(device_signature_dna); cudaFree(device_signature_score);
     cudaFree(device_samples); cudaFree(device_signatures);
-    cudaFree(device_integrity_hashes); cudaFree(device_sample_score_prefix_sum);
+    cudaFree(device_sample_score_prefix_sum);
     cudaFree(device_results);
 }
